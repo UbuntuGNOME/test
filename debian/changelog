@@ -1,3 +1,13 @@
+gdm (3.14.0-0ubuntu1~utopic2) utopic; urgency=medium
+
+  * New upstream release
+  * debian/libgdm1.symbols: add 4 new symbols
+  * debian/patches/revert_override_LANG_with_accountservices.patch:
+     On Ubuntu accountservices only stores the language and not the
+     full locale as need by LANG.
+
+ -- Tim Lunn <tim@feathertop.org>  Sat, 04 Oct 2014 20:07:25 +1000
+
 gdm (3.12.2-0ubuntu1~utopic2) utopic; urgency=medium
 
   * debian/control.in: 

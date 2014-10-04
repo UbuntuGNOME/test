@@ -1570,6 +1570,7 @@ gdm_session_worker_get_environment (GdmSessionWorker *worker)
         return (const char * const *) pam_getenvlist (worker->priv->pam_handle);
 }
 
+#ifdef WITH_CONSOLE_KIT
 static void
 register_ck_session (GdmSessionWorker *worker)
 {
@@ -1579,7 +1580,6 @@ register_ck_session (GdmSessionWorker *worker)
         }
 #endif
 
-#ifdef WITH_CONSOLE_KIT
         open_ck_session (worker);
 
         if (worker->priv->session_cookie != NULL) {
@@ -1587,8 +1587,8 @@ register_ck_session (GdmSessionWorker *worker)
                                                              "XDG_SESSION_COOKIE",
                                                              worker->priv->session_cookie);
         }
-#endif
 }
+#endif
 
 static gboolean
 run_script (GdmSessionWorker *worker,
@@ -1836,6 +1836,7 @@ gdm_session_worker_start_session (GdmSessionWorker  *worker,
                 char  *home_dir;
                 int    stdin_fd = -1, stdout_fd = -1, stderr_fd = -1;
                 gboolean has_journald = FALSE;
+                sigset_t mask;
 
                 /* Leak the TTY into the session as stdin so that it stays open
                  * without any races. */
@@ -1943,6 +1944,19 @@ gdm_session_worker_start_session (GdmSessionWorker  *worker,
                  * SIGPIPE.
                  */
                 signal (SIGPIPE, SIG_DFL);
+
+                /*
+                 * Reset SIGUSR1 to default since it was blocked by the manager
+                 * process for the X server startup handshake
+                 */
+                signal (SIGUSR1, SIG_DFL);
+
+                /*
+                 * Reset signal mask to default since it was altered by the
+                 * manager process
+                 */
+                sigemptyset (&mask);
+                sigprocmask (SIG_SETMASK, &mask, NULL);
 
                 gdm_session_execute (worker->priv->arguments[0],
                                      worker->priv->arguments,
@@ -2157,7 +2171,7 @@ gdm_session_worker_open_session (GdmSessionWorker  *worker,
                              GDM_SESSION_WORKER_ERROR,
                              GDM_SESSION_WORKER_ERROR_OPENING_SESSION,
                              "Failed to execute PostLogin script");
-                goto out;
+                return FALSE;
         }
 
         error_code = pam_open_session (worker->priv->pam_handle, flags);

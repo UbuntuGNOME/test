@@ -66,7 +66,6 @@ typedef struct
         GdmSessionWorkerJob   *job;
         GPid                   worker_pid;
         char                  *service_name;
-        GDBusConnection       *worker_connection;
         GDBusMethodInvocation *starting_invocation;
         char                  *starting_username;
         GDBusMethodInvocation *pending_invocation;
@@ -87,6 +86,10 @@ struct _GdmSessionPrivate
         char                *saved_language;
         char                *selected_user;
         char                *user_x11_authority_file;
+
+        char                *timed_login_username;
+        int                  timed_login_delay;
+        GList               *pending_timed_login_invocations;
 
         GHashTable          *conversations;
 
@@ -992,6 +995,18 @@ allow_worker_function (GDBusAuthObserver *observer,
         return FALSE;
 }
 
+static void
+on_worker_connection_closed (GDBusConnection *connection,
+                             gboolean         remote_peer_vanished,
+                             GError          *error,
+                             GdmSession      *self)
+{
+        self->priv->pending_worker_connections =
+            g_list_remove (self->priv->pending_worker_connections,
+                           connection);
+        g_object_unref (connection);
+}
+
 static gboolean
 register_worker (GdmDBusWorkerManager  *worker_manager_interface,
                  GDBusMethodInvocation *invocation,
@@ -1020,6 +1035,10 @@ register_worker (GdmDBusWorkerManager  *worker_manager_interface,
                 g_list_delete_link (self->priv->pending_worker_connections,
                                     connection_node);
 
+        g_signal_handlers_disconnect_by_func (connection,
+                                              G_CALLBACK (on_worker_connection_closed),
+                                              self);
+
         credentials = g_dbus_connection_get_peer_credentials (connection);
         pid = g_credentials_get_unix_pid (credentials, NULL);
 
@@ -1037,12 +1056,15 @@ register_worker (GdmDBusWorkerManager  *worker_manager_interface,
 
         g_dbus_method_invocation_return_value (invocation, NULL);
 
-        conversation->worker_connection = connection;
         conversation->worker_proxy = gdm_dbus_worker_proxy_new_sync (connection,
                                                                      G_DBUS_PROXY_FLAGS_NONE,
                                                                      NULL,
                                                                      GDM_WORKER_DBUS_PATH,
                                                                      NULL, NULL);
+        /* drop the reference we stole from the pending connections list
+         * since the proxy owns the connection now */
+        g_object_unref (connection);
+
         g_dbus_proxy_set_default_timeout (G_DBUS_PROXY (conversation->worker_proxy), G_MAXINT);
 
         g_signal_connect (conversation->worker_proxy,
@@ -1127,15 +1149,27 @@ export_worker_manager_interface (GdmSession      *self,
 }
 
 static void
-on_worker_connection_closed (GDBusConnection *connection,
-                             gboolean         remote_peer_vanished,
-                             GError          *error,
-                             GdmSession      *self)
+unexport_worker_manager_interface (GdmSession           *self,
+                                   GdmDBusWorkerManager *worker_manager_interface)
 {
-        self->priv->pending_worker_connections =
-            g_list_remove (self->priv->pending_worker_connections,
-                           connection);
-        g_object_unref (connection);
+
+        g_dbus_interface_skeleton_unexport (G_DBUS_INTERFACE_SKELETON (worker_manager_interface));
+
+        g_signal_handlers_disconnect_by_func (worker_manager_interface,
+                                              G_CALLBACK (register_worker),
+                                              self);
+        g_signal_handlers_disconnect_by_func (worker_manager_interface,
+                                              G_CALLBACK (gdm_session_handle_info_query),
+                                              self);
+        g_signal_handlers_disconnect_by_func (worker_manager_interface,
+                                              G_CALLBACK (gdm_session_handle_secret_info_query),
+                                              self);
+        g_signal_handlers_disconnect_by_func (worker_manager_interface,
+                                              G_CALLBACK (gdm_session_handle_info),
+                                              self);
+        g_signal_handlers_disconnect_by_func (worker_manager_interface,
+                                              G_CALLBACK (gdm_session_handle_problem),
+                                              self);
 }
 
 static gboolean
@@ -1296,6 +1330,27 @@ gdm_session_handle_client_start_session_when_ready (GdmDBusGreeter        *greet
 }
 
 static gboolean
+gdm_session_handle_get_timed_login_details (GdmDBusGreeter        *greeter_interface,
+                                            GDBusMethodInvocation *invocation,
+                                            GdmSession            *self)
+{
+
+        if (self->priv->greeter_interface != NULL) {
+                gdm_dbus_greeter_complete_get_timed_login_details (greeter_interface,
+                                                                   invocation,
+                                                                   self->priv->timed_login_username != NULL,
+                                                                   self->priv->timed_login_username != NULL? self->priv->timed_login_username : "",
+                                                                   self->priv->timed_login_delay);
+                if (self->priv->timed_login_username != NULL) {
+                        gdm_dbus_greeter_emit_timed_login_requested (self->priv->greeter_interface,
+                                                                     self->priv->timed_login_username,
+                                                                     self->priv->timed_login_delay);
+                }
+        }
+        return TRUE;
+}
+
+static gboolean
 gdm_session_handle_client_begin_auto_login (GdmDBusGreeter        *greeter_interface,
                                             GDBusMethodInvocation *invocation,
                                             const char            *username,
@@ -1367,6 +1422,10 @@ export_greeter_interface (GdmSession      *self,
         g_signal_connect (greeter_interface,
                           "handle-start-session-when-ready",
                           G_CALLBACK (gdm_session_handle_client_start_session_when_ready),
+                          self);
+        g_signal_connect (greeter_interface,
+                          "handle-get-timed-login-details",
+                          G_CALLBACK (gdm_session_handle_get_timed_login_details),
                           self);
 
         g_dbus_interface_skeleton_export (G_DBUS_INTERFACE_SKELETON (greeter_interface),
@@ -1639,6 +1698,8 @@ free_conversation (GdmSessionConversation *conversation)
         g_free (conversation->service_name);
         g_free (conversation->starting_username);
         g_free (conversation->session_id);
+        g_clear_object (&conversation->worker_manager_interface);
+        g_clear_object (&conversation->worker_proxy);
         g_clear_object (&conversation->session);
         g_free (conversation);
 }
@@ -1804,12 +1865,24 @@ start_conversation (GdmSession *self,
 }
 
 static void
+close_conversation (GdmSessionConversation *conversation)
+{
+        GdmSession *self = conversation->session;
+
+        if (conversation->worker_manager_interface != NULL) {
+                unexport_worker_manager_interface (self, conversation->worker_manager_interface);
+        }
+
+        if (conversation->worker_proxy != NULL) {
+                GDBusConnection *connection = g_dbus_proxy_get_connection (G_DBUS_PROXY (conversation->worker_proxy));
+                g_dbus_connection_close_sync (connection, NULL, NULL);
+        }
+}
+
+static void
 stop_conversation (GdmSessionConversation *conversation)
 {
-        if (conversation->worker_connection != NULL) {
-                g_dbus_connection_close_sync (conversation->worker_connection, NULL, NULL);
-                g_clear_object (&conversation->worker_connection);
-        }
+        close_conversation (conversation);
 
         conversation->is_stopping = TRUE;
         gdm_session_worker_job_stop (conversation->job);
@@ -1818,12 +1891,7 @@ stop_conversation (GdmSessionConversation *conversation)
 static void
 stop_conversation_now (GdmSessionConversation *conversation)
 {
-        g_clear_object (&conversation->worker_manager_interface);
-
-        if (conversation->worker_connection != NULL) {
-                g_dbus_connection_close_sync (conversation->worker_connection, NULL, NULL);
-                g_clear_object (&conversation->worker_connection);
-        }
+        close_conversation (conversation);
 
         gdm_session_worker_job_stop_now (conversation->job);
         g_clear_object (&conversation->job);
@@ -2327,6 +2395,7 @@ set_up_session_environment (GdmSession *self)
 {
         GdmSessionDisplayMode display_mode;
         gchar *desktop_names;
+        const char *locale;
 
         gdm_session_set_environment_variable (self,
                                               "GDMSESSION",
@@ -2345,6 +2414,17 @@ set_up_session_environment (GdmSession *self)
 
         set_up_session_language (self);
 
+        locale = get_default_language_name (self);
+
+        if (locale != NULL && locale[0] != '\0') {
+                gdm_session_set_environment_variable (self,
+                                                      "LANG",
+                                                      locale);
+                gdm_session_set_environment_variable (self,
+                                                      "GDM_LANG",
+                                                      locale);
+        }
+
         display_mode = gdm_session_get_display_mode (self);
         if (display_mode == GDM_SESSION_DISPLAY_MODE_REUSE_VT) {
                 gdm_session_set_environment_variable (self,
@@ -2356,6 +2436,12 @@ set_up_session_environment (GdmSession *self)
                                                               "XAUTHORITY",
                                                               self->priv->user_x11_authority_file);
                 }
+        }
+
+        if (g_getenv ("WINDOWPATH") != NULL) {
+                gdm_session_set_environment_variable (self,
+                                                      "WINDOWPATH",
+                                                      g_getenv ("WINDOWPATH"));
         }
 
         g_free (desktop_names);
@@ -2609,15 +2695,13 @@ gdm_session_reset (GdmSession *self)
 }
 
 void
-gdm_session_request_timed_login (GdmSession *self,
-                                 const char *username,
-                                 int         delay)
+gdm_session_set_timed_login_details (GdmSession *self,
+                                     const char *username,
+                                     int         delay)
 {
-        if (self->priv->greeter_interface != NULL) {
-                gdm_dbus_greeter_emit_timed_login_requested (self->priv->greeter_interface,
-                                                             username,
-                                                             delay);
-        }
+        g_debug ("GdmSession: timed login details %s %d", username, delay);
+        self->priv->timed_login_username = g_strdup (username);
+        self->priv->timed_login_delay = delay;
 }
 
 gboolean
