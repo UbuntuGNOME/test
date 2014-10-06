@@ -84,8 +84,8 @@ ACLOCAL_M4 = $(top_srcdir)/aclocal.m4
 am__aclocal_m4_deps = $(top_srcdir)/m4/intltool.m4 \
 	$(top_srcdir)/m4/libtool.m4 $(top_srcdir)/m4/ltoptions.m4 \
 	$(top_srcdir)/m4/ltsugar.m4 $(top_srcdir)/m4/ltversion.m4 \
-	$(top_srcdir)/m4/lt~obsolete.m4 $(top_srcdir)/acinclude.m4 \
-	$(top_srcdir)/configure.ac
+	$(top_srcdir)/m4/lt~obsolete.m4 $(top_srcdir)/m4/nls.m4 \
+	$(top_srcdir)/acinclude.m4 $(top_srcdir)/configure.ac
 am__configure_deps = $(am__aclocal_m4_deps) $(CONFIGURE_DEPENDENCIES) \
 	$(ACLOCAL_M4)
 mkinstalldirs = $(install_sh) -d
@@ -407,12 +407,21 @@ top_builddir = @top_builddir@
 top_srcdir = @top_srcdir@
 NULL = 
 desktopdir = $(pkgdatadir)/greeter/autostart
+desktop_in_files = \
+	caribou-autostart.desktop.in					\
+	$(NULL)
+
 desktop_DATA = orca-autostart.desktop					\
-	       caribou-autostart.desktop				\
+	       $(desktop_in_files:.desktop.in=.desktop)			\
 	       $(NULL)
 
 EXTRA_DIST = \
+	$(desktop_in_files)						\
 	$(desktop_DATA)							\
+	$(NULL)
+
+DISTCLEANFILES = \
+	$(desktop_in_files:.desktop.in=.desktop)			\
 	$(NULL)
 
 MAINTAINERCLEANFILES = \
@@ -549,6 +558,7 @@ clean-generic:
 distclean-generic:
 	-test -z "$(CONFIG_CLEAN_FILES)" || rm -f $(CONFIG_CLEAN_FILES)
 	-test . = "$(srcdir)" || test -z "$(CONFIG_CLEAN_VPATH_FILES)" || rm -f $(CONFIG_CLEAN_VPATH_FILES)
+	-test -z "$(DISTCLEANFILES)" || rm -f $(DISTCLEANFILES)
 
 maintainer-clean-generic:
 	@echo "This command is intended for maintainers to use"
@@ -635,6 +645,9 @@ uninstall-am: uninstall-desktopDATA
 	mostlyclean-libtool pdf pdf-am ps ps-am tags-am uninstall \
 	uninstall-am uninstall-desktopDATA
 
+
+%.desktop: %.desktop.in Makefile
+	$(AM_V_GEN) sed -e 's|@LIBEXECDIR[@]|$(libexecdir)|g' $< >$@
 
 # Tell versions [3.59,3.63) of GNU make to not export all variables.
 # Otherwise a system limit (for SysV at least) may be exceeded.

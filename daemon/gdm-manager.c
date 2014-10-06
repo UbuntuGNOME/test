@@ -1573,49 +1573,6 @@ get_display_device (GdmManager *manager,
 }
 
 static void
-on_ready_to_request_timed_login (GdmSession         *session,
-                                 GSimpleAsyncResult *result,
-                                 gpointer           *user_data)
-{
-        int delay = GPOINTER_TO_INT (user_data);
-        GCancellable *cancellable;
-        char         *username;
-
-        cancellable = g_object_get_data (G_OBJECT (result),
-                                         "cancellable");
-        if (g_cancellable_is_cancelled (cancellable)) {
-                return;
-        }
-
-        username = g_simple_async_result_get_source_tag (result);
-
-        gdm_session_request_timed_login (session, username, delay);
-
-        g_object_weak_unref (G_OBJECT (session),
-                             (GWeakNotify)
-                             g_cancellable_cancel,
-                             cancellable);
-        g_object_weak_unref (G_OBJECT (session),
-                             (GWeakNotify)
-                             g_object_unref,
-                             cancellable);
-        g_object_weak_unref (G_OBJECT (session),
-                             (GWeakNotify)
-                             g_free,
-                             username);
-
-        g_free (username);
-}
-
-static gboolean
-on_wait_for_greeter_timeout (GSimpleAsyncResult *result)
-{
-        g_simple_async_result_complete (result);
-
-        return FALSE;
-}
-
-static void
 on_session_reauthenticated (GdmSession *session,
                             const char *service_name,
                             GdmManager *manager)
@@ -1683,56 +1640,12 @@ on_session_client_connected (GdmSession      *session,
                 return;
         }
 
-        /* temporary hack to fix timed login
-         * http://bugzilla.gnome.org/680348
-         */
         if (delay > 0) {
-                GSimpleAsyncResult *result;
-                GCancellable       *cancellable;
-                guint               timeout_id;
-                gpointer            source_tag;
-
-                delay = MAX (delay, 4);
-
-                cancellable = g_cancellable_new ();
-                source_tag = g_strdup (username);
-                result = g_simple_async_result_new (G_OBJECT (session),
-                                                    (GAsyncReadyCallback)
-                                                    on_ready_to_request_timed_login,
-                                                    GINT_TO_POINTER (delay),
-                                                    source_tag);
-                g_simple_async_result_set_check_cancellable (result, cancellable);
-                g_object_set_data (G_OBJECT (result),
-                                   "cancellable",
-                                   cancellable);
-
-                timeout_id = g_timeout_add_seconds_full (delay - 2,
-                                                         G_PRIORITY_DEFAULT,
-                                                         (GSourceFunc)
-                                                         on_wait_for_greeter_timeout,
-                                                         g_object_ref (result),
-                                                         (GDestroyNotify)
-                                                         g_object_unref);
-                g_cancellable_connect (cancellable,
-                                       G_CALLBACK (g_source_remove),
-                                       GINT_TO_POINTER (timeout_id),
-                                       NULL);
-
-                g_object_weak_ref (G_OBJECT (session),
-                                   (GWeakNotify)
-                                   g_cancellable_cancel,
-                                   cancellable);
-                g_object_weak_ref (G_OBJECT (session),
-                                   (GWeakNotify)
-                                   g_object_unref,
-                                   cancellable);
-                g_object_weak_ref (G_OBJECT (session),
-                                   (GWeakNotify)
-                                   g_free,
-                                   source_tag);
+                gdm_session_set_timed_login_details (session, username, delay);
         }
 
         g_free (username);
+
 }
 
 static void
@@ -1881,13 +1794,12 @@ on_session_reauthentication_started (GdmSession *session,
                                           source_tag);
 
         if (invocation != NULL) {
+                g_hash_table_steal (manager->priv->open_reauthentication_requests,
+                                    source_tag);
                 gdm_dbus_manager_complete_open_reauthentication_channel (GDM_DBUS_MANAGER (manager),
                                                                          invocation,
                                                                          address);
         }
-
-        g_hash_table_remove (manager->priv->open_reauthentication_requests,
-                             source_tag);
 }
 
 static void
@@ -1896,12 +1808,13 @@ start_autologin_conversation_if_necessary (GdmManager *manager,
                                            GdmSession *session)
 {
         gboolean enabled;
+        int delay = 0;
 
-        if (g_file_test (GDM_RAN_ONCE_MARKER_FILE, G_FILE_TEST_EXISTS)) {
+        gdm_display_get_timed_login_details (display, &enabled, NULL, &delay, NULL);
+
+        if (delay == 0 && g_file_test (GDM_RAN_ONCE_MARKER_FILE, G_FILE_TEST_EXISTS)) {
                 return;
         }
-
-        gdm_display_get_timed_login_details (display, &enabled, NULL, NULL, NULL);
 
         if (!enabled) {
                 return;
@@ -2374,6 +2287,18 @@ unexport_display (const char *id,
 }
 
 static void
+finish_display (const char *id,
+                GdmDisplay *display,
+                GdmManager *manager)
+{
+        if (gdm_display_get_status (display) != GDM_DISPLAY_MANAGED)
+                return;
+
+        gdm_display_unmanage (display);
+        gdm_display_finish (display);
+}
+
+static void
 gdm_manager_finalize (GObject *object)
 {
         GdmManager *manager;
@@ -2407,6 +2332,10 @@ gdm_manager_finalize (GObject *object)
                                            manager);
                 g_dbus_interface_skeleton_unexport (G_DBUS_INTERFACE_SKELETON (manager));
         }
+
+        gdm_display_store_foreach (manager->priv->display_store,
+                                   (GdmDisplayStoreFunc) finish_display,
+                                   manager);
 
         gdm_display_store_clear (manager->priv->display_store);
 
