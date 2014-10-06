@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PolicyKit Authentication Agent
+Name[bn]=PolicyKit অনুমোদনের এজেন্ট
+Name[br]=Gwezhour dilesa PolicyKit
+Name[fy]=PolicyKit Ferifikaasjeagint
+Exec=/usr/libexec/polkit-gnome-authentication-agent-1
+OnlyShowIn=GNOME;
+
